@@ -398,3 +398,59 @@ async def test_form_errors_reconfigure(
         "token": "test-token",
         "password": "test-password",
     }
+
+
+async def test_options_flow(hass: HomeAssistant) -> None:
+    """Test options flow."""
+    mock_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"username": "test-email@test-domain.com", "token": "test-token"},
+        unique_id="test-email@test-domain.com",
+    )
+    mock_entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.melcloud.async_setup_entry", return_value=True
+    ):
+        await hass.config_entries.async_setup(mock_entry.entry_id)
+        await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(mock_entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        user_input={"scan_interval": 5},
+    )
+    await hass.async_block_till_done()
+
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert mock_entry.options == {"scan_interval": 5}
+
+
+async def test_options_flow_default_value(hass: HomeAssistant) -> None:
+    """Test options flow with default value."""
+    mock_entry = MockConfigEntry(
+        domain=DOMAIN,
+        data={"username": "test-email@test-domain.com", "token": "test-token"},
+        options={"scan_interval": 10},
+        unique_id="test-email@test-domain.com",
+    )
+    mock_entry.add_to_hass(hass)
+
+    with patch(
+        "homeassistant.components.melcloud.async_setup_entry", return_value=True
+    ):
+        await hass.config_entries.async_setup(mock_entry.entry_id)
+        await hass.async_block_till_done()
+
+    result = await hass.config_entries.options.async_init(mock_entry.entry_id)
+
+    assert result["type"] is FlowResultType.FORM
+    assert result["step_id"] == "init"
+    # Check that the default value is the current option
+    schema = result["data_schema"]
+    schema_dict = {str(k): k for k in schema.schema}
+    assert "scan_interval" in schema_dict

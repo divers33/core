@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
 from typing import Any, cast
 
 from pymelcloud import DEVICE_TYPE_ATA, DEVICE_TYPE_ATW, AtaDevice, AtwDevice
@@ -25,11 +24,12 @@ from homeassistant.components.climate import (
     HVACMode,
 )
 from homeassistant.const import ATTR_TEMPERATURE, UnitOfTemperature
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import config_validation as cv, entity_platform
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
-from . import MelCloudConfigEntry, MelCloudDevice
+from . import MelCloudConfigEntry
 from .const import (
     ATTR_STATUS,
     ATTR_VANE_HORIZONTAL,
@@ -40,8 +40,7 @@ from .const import (
     SERVICE_SET_VANE_HORIZONTAL,
     SERVICE_SET_VANE_VERTICAL,
 )
-
-SCAN_INTERVAL = timedelta(seconds=60)
+from .coordinator import MelCloudDataUpdateCoordinator, MelCloudDevice
 
 
 ATA_HVAC_MODE_LOOKUP = {
@@ -52,6 +51,24 @@ ATA_HVAC_MODE_LOOKUP = {
     ata.OPERATION_MODE_HEAT_COOL: HVACMode.HEAT_COOL,
 }
 ATA_HVAC_MODE_REVERSE_LOOKUP = {v: k for k, v in ATA_HVAC_MODE_LOOKUP.items()}
+
+# Friendly vane position names (API value -> Display name)
+VANE_HORIZONTAL_POSITIONS = {
+    "1": "Left",
+    "2": "Left-Center",
+    "3": "Center",
+    "4": "Right-Center",
+    "5": "Right",
+    "12": "Swing",
+}
+VANE_VERTICAL_POSITIONS = {
+    "1": "Up",
+    "2": "Up-Center",
+    "3": "Center",
+    "4": "Down-Center",
+    "5": "Down",
+    "7": "Swing",
+}
 
 
 ATW_ZONE_HVAC_MODE_LOOKUP = {
@@ -79,22 +96,20 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     """Set up MelCloud device climate based on config_entry."""
-    mel_devices = entry.runtime_data
+    coordinator = entry.runtime_data
+    mel_devices = coordinator.data
     entities: list[AtaDeviceClimate | AtwDeviceZoneClimate] = [
-        AtaDeviceClimate(mel_device, mel_device.device)
+        AtaDeviceClimate(coordinator, mel_device, mel_device.device)
         for mel_device in mel_devices[DEVICE_TYPE_ATA]
     ]
     entities.extend(
         [
-            AtwDeviceZoneClimate(mel_device, mel_device.device, zone)
+            AtwDeviceZoneClimate(coordinator, mel_device, mel_device.device, zone)
             for mel_device in mel_devices[DEVICE_TYPE_ATW]
             for zone in mel_device.device.zones
         ]
     )
-    async_add_entities(
-        entities,
-        True,
-    )
+    async_add_entities(entities)
 
     platform = entity_platform.async_get_current_platform()
     platform.async_register_entity_service(
@@ -109,21 +124,27 @@ async def async_setup_entry(
     )
 
 
-class MelCloudClimate(ClimateEntity):
+class MelCloudClimate(CoordinatorEntity[MelCloudDataUpdateCoordinator], ClimateEntity):
     """Base climate device."""
 
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_has_entity_name = True
     _attr_name = None
 
-    def __init__(self, device: MelCloudDevice) -> None:
+    def __init__(
+        self,
+        coordinator: MelCloudDataUpdateCoordinator,
+        device: MelCloudDevice,
+    ) -> None:
         """Initialize the climate."""
+        super().__init__(coordinator)
         self.api = device
         self._base_device = self.api.device
 
-    async def async_update(self) -> None:
-        """Update state from MELCloud."""
-        await self.api.async_update()
+    @property
+    def available(self) -> bool:
+        """Return True if entity is available."""
+        return super().available and self.api.available
 
     @property
     def target_temperature_step(self) -> float | None:
@@ -142,26 +163,32 @@ class AtaDeviceClimate(MelCloudClimate):
         | ClimateEntityFeature.TURN_ON
     )
 
-    def __init__(self, device: MelCloudDevice, ata_device: AtaDevice) -> None:
+    def __init__(
+        self,
+        coordinator: MelCloudDataUpdateCoordinator,
+        device: MelCloudDevice,
+        ata_device: AtaDevice,
+    ) -> None:
         """Initialize the climate."""
-        super().__init__(device)
+        super().__init__(coordinator, device)
         self._device = ata_device
 
         self._attr_unique_id = f"{self.api.device.serial}-{self.api.device.mac}"
         self._attr_device_info = self.api.device_info
 
-    async def async_added_to_hass(self) -> None:
-        """When entity is added to hass."""
-        await super().async_added_to_hass()
-
-        # We can only check for vane_horizontal once we fetch the device data from the cloud
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        """Handle updated data from the coordinator."""
+        # Update supported features when vane_horizontal becomes available
         if self._device.vane_horizontal:
             self._attr_supported_features |= ClimateEntityFeature.SWING_HORIZONTAL_MODE
+        super()._handle_coordinator_update()
 
     @property
     def extra_state_attributes(self) -> dict[str, Any] | None:
         """Return the optional state attributes with device specific additions."""
-        attr = {}
+        attr: dict[str, Any] = {ATTR_STATUS: self._device.status}
+        attr.update(self.api.extra_attributes)
 
         if vane_horizontal := self._device.vane_horizontal:
             attr.update(
@@ -209,6 +236,7 @@ class AtaDeviceClimate(MelCloudClimate):
         set_dict: dict[str, Any] = {}
         self._apply_set_hvac_mode(hvac_mode, set_dict)
         await self._device.set(set_dict)
+        await self.coordinator.async_request_refresh()
 
     @property
     def hvac_modes(self) -> list[HVACMode]:
@@ -242,6 +270,7 @@ class AtaDeviceClimate(MelCloudClimate):
 
         if set_dict:
             await self._device.set(set_dict)
+            await self.coordinator.async_request_refresh()
 
     @property
     def fan_mode(self) -> str | None:
@@ -251,6 +280,7 @@ class AtaDeviceClimate(MelCloudClimate):
     async def async_set_fan_mode(self, fan_mode: str) -> None:
         """Set new target fan mode."""
         await self._device.set({"fan_speed": fan_mode})
+        await self.coordinator.async_request_refresh()
 
     @property
     def fan_modes(self) -> list[str] | None:
@@ -265,6 +295,7 @@ class AtaDeviceClimate(MelCloudClimate):
                 f" [{self._device.vane_horizontal_positions}]."
             )
         await self._device.set({ata.PROPERTY_VANE_HORIZONTAL: position})
+        await self.coordinator.async_request_refresh()
 
     async def async_set_vane_vertical(self, position: str) -> None:
         """Set vertical vane position."""
@@ -274,42 +305,73 @@ class AtaDeviceClimate(MelCloudClimate):
                 f" [{self._device.vane_vertical_positions}]."
             )
         await self._device.set({ata.PROPERTY_VANE_VERTICAL: position})
+        await self.coordinator.async_request_refresh()
+
+    def _get_friendly_vane_vertical(self, position: str | None) -> str | None:
+        """Return friendly name for vertical vane position."""
+        if position is None:
+            return None
+        return VANE_VERTICAL_POSITIONS.get(position, position)
+
+    def _get_friendly_vane_horizontal(self, position: str | None) -> str | None:
+        """Return friendly name for horizontal vane position."""
+        if position is None:
+            return None
+        return VANE_HORIZONTAL_POSITIONS.get(position, position)
+
+    def _get_api_vane_vertical(self, friendly_name: str) -> str:
+        """Return API value for vertical vane friendly name."""
+        reverse = {v: k for k, v in VANE_VERTICAL_POSITIONS.items()}
+        return reverse.get(friendly_name, friendly_name)
+
+    def _get_api_vane_horizontal(self, friendly_name: str) -> str:
+        """Return API value for horizontal vane friendly name."""
+        reverse = {v: k for k, v in VANE_HORIZONTAL_POSITIONS.items()}
+        return reverse.get(friendly_name, friendly_name)
 
     @property
     def swing_mode(self) -> str | None:
         """Return vertical vane position or mode."""
-        return self._device.vane_vertical
+        return self._get_friendly_vane_vertical(self._device.vane_vertical)
 
     @property
     def swing_horizontal_mode(self) -> str | None:
         """Return horizontal vane position or mode."""
-        return self._device.vane_horizontal
+        return self._get_friendly_vane_horizontal(self._device.vane_horizontal)
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
         """Set vertical vane position or mode."""
-        await self.async_set_vane_vertical(swing_mode)
+        await self.async_set_vane_vertical(self._get_api_vane_vertical(swing_mode))
 
     async def async_set_swing_horizontal_mode(self, swing_horizontal_mode: str) -> None:
         """Set horizontal vane position or mode."""
-        await self.async_set_vane_horizontal(swing_horizontal_mode)
+        await self.async_set_vane_horizontal(self._get_api_vane_horizontal(swing_horizontal_mode))
 
     @property
     def swing_modes(self) -> list[str] | None:
         """Return a list of available vertical vane positions and modes."""
-        return self._device.vane_vertical_positions
+        positions = self._device.vane_vertical_positions
+        if positions is None:
+            return None
+        return [self._get_friendly_vane_vertical(p) or p for p in positions]
 
     @property
     def swing_horizontal_modes(self) -> list[str] | None:
         """Return a list of available horizontal vane positions and modes."""
-        return self._device.vane_horizontal_positions
+        positions = self._device.vane_horizontal_positions
+        if positions is None:
+            return None
+        return [self._get_friendly_vane_horizontal(p) or p for p in positions]
 
     async def async_turn_on(self) -> None:
         """Turn the entity on."""
         await self._device.set({"power": True})
+        await self.coordinator.async_request_refresh()
 
     async def async_turn_off(self) -> None:
         """Turn the entity off."""
         await self._device.set({"power": False})
+        await self.coordinator.async_request_refresh()
 
     @property
     def min_temp(self) -> float:
@@ -338,10 +400,14 @@ class AtwDeviceZoneClimate(MelCloudClimate):
     _attr_supported_features = ClimateEntityFeature.TARGET_TEMPERATURE
 
     def __init__(
-        self, device: MelCloudDevice, atw_device: AtwDevice, atw_zone: Zone
+        self,
+        coordinator: MelCloudDataUpdateCoordinator,
+        device: MelCloudDevice,
+        atw_device: AtwDevice,
+        atw_zone: Zone,
     ) -> None:
         """Initialize the climate."""
-        super().__init__(device)
+        super().__init__(coordinator, device)
         self._device = atw_device
         self._zone = atw_zone
 
@@ -360,15 +426,17 @@ class AtwDeviceZoneClimate(MelCloudClimate):
     @property
     def hvac_mode(self) -> HVACMode:
         """Return hvac operation ie. heat, cool mode."""
-        mode = self._zone.operation_mode
-        if not self._device.power or mode is None:
+        # Use zone status (heat/cool/idle) not operation_mode (heat-thermostat/etc.)
+        status = self._zone.status
+        if not self._device.power or status is None:
             return HVACMode.OFF
-        return ATW_ZONE_HVAC_MODE_LOOKUP.get(mode, HVACMode.OFF)
+        return ATW_ZONE_HVAC_MODE_LOOKUP.get(status, HVACMode.OFF)
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
         """Set new target hvac mode."""
         if hvac_mode == HVACMode.OFF:
             await self._device.set({"power": False})
+            await self.coordinator.async_request_refresh()
             return
 
         operation_mode = ATW_ZONE_HVAC_MODE_REVERSE_LOOKUP.get(hvac_mode)
@@ -382,6 +450,7 @@ class AtwDeviceZoneClimate(MelCloudClimate):
         if self.hvac_mode == HVACMode.OFF:
             props["power"] = True
         await self._device.set(props)
+        await self.coordinator.async_request_refresh()
 
     @property
     def hvac_modes(self) -> list[HVACMode]:
@@ -410,3 +479,4 @@ class AtwDeviceZoneClimate(MelCloudClimate):
         await self._zone.set_target_temperature(
             kwargs.get(ATTR_TEMPERATURE, self.target_temperature)
         )
+        await self.coordinator.async_request_refresh()
